@@ -1,0 +1,99 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# [START gke_autoscaling_ccc_validatingadmissionpolicy]
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: restrict-computeclass-usage
+spec:
+  failurePolicy: Fail # If an internal error occurs, deny the request.
+  variables:
+  # Check whether the admission request is for a Deployment.
+  - name: isDeployment
+    expression: "object.kind == 'Deployment'"
+  # Get the Pod specification from the admission request by reading the
+  # spec.template.spec field for Deployments or the spec field for static Pods.
+  - name: podSpec
+    expression: "variables.isDeployment ? object.spec.template.spec : object.spec"
+  # Check whether a node selector or an affinity rule that explicitly requests a
+  # disallowed ComputeClass.
+  - name: hasForbiddenNodeSelectorOrAffinity
+    expression: >-
+      (has(variables.podSpec.nodeSelector) &&
+      variables.podSpec.nodeSelector['cloud.google.com/compute-class'] == 'COMPUTECLASS_NAME') ||
+      (has(variables.podSpec.affinity) &&
+      has(variables.podSpec.affinity.nodeAffinity) &&
+      has(variables.podSpec.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution) &&
+      variables.podSpec.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms.exists(term, has(term.matchExpressions) &&
+        term.matchExpressions.exists(
+          exp, exp.key == 'cloud.google.com/compute-class' &&
+          exp.operator == 'In' && exp.values.exists(v, v == 'COMPUTECLASS_NAME')
+        )
+      ))
+
+  # Check whether the Pod has a toleration for the taint that corresponds to a
+  # disallowed ComputeClass.
+  - name: hasForbiddenComputeClassToleration
+    expression: >-
+      has(variables.podSpec.tolerations) &&
+      variables.podSpec.tolerations.exists(t, 
+        t.key == 'cloud.google.com/compute-class' &&
+        (t.operator == 'Exists' || (t.operator == 'Equal' && t.value == 'COMPUTECLASS_NAME')) &&
+        has(t.effect) && t.effect == 'NoSchedule')
+
+  # Check whether the Pod has a toleration that could match any taint.
+  - name: hasWildcardToleration
+    expression: >-
+      has(variables.podSpec.tolerations) &&
+      variables.podSpec.tolerations.exists(t, 
+        (t.operator == 'Exists' && !(has(t.key) && t.key != ''))
+      )
+
+  # Trigger the ValidatingAdmissionPolicy when Pods or Deployments are created or
+  # updated.
+  matchConstraints:
+    resourceRules:
+    - apiGroups: [""]
+      apiVersions: ["v1"]
+      operations: ["CREATE", "UPDATE"] 
+      resources: ["pods"]
+    - apiGroups: ["apps"]
+      apiVersions: ["v1"]
+      operations: ["CREATE", "UPDATE"]
+      resources: ["deployments"]
+
+  # Validate whether any of the expressions in the variables section evaluate to
+  # true.
+  validations:
+    - expression: >-
+        !(variables.hasForbiddenNodeSelectorOrAffinity ||
+          variables.hasForbiddenComputeClassToleration ||
+          variables.hasWildcardToleration)
+      message: "Pods and Deployments in this namespace cannot request ComputeClass COMPUTECLASS_NAME or use wildcard tolerations."
+# [END gke_autoscaling_ccc_validatingadmissionpolicy]
+---
+# [START gke_autoscaling_ccc_validatingadmissionpolicybinding]
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: restrict-computeclass-usage-binding
+spec:
+  policyName: restrict-computeclass-usage
+  validationActions: ["Deny","Audit"]
+  matchResources:
+    namespaceSelector:
+      matchLabels: 
+        kubernetes.io/metadata.name: NAMESPACE # Replace with the name of a namespace.
+# [END gke_autoscaling_ccc_validatingadmissionpolicybinding]
